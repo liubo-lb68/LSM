@@ -1,320 +1,339 @@
 import os
-import random
-
 import numpy as np
 import pandas as pd
-import matplotlib
 import matplotlib.pyplot as plt
+import random
 from tqdm import tqdm
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import precision_score, recall_score, roc_auc_score, roc_curve, precision_recall_curve
+from sklearn.metrics import precision_score, recall_score, roc_auc_score, roc_curve
 import pydotplus
-import xgboost as xgb
+import joblib
+from sklearn import metrics
+from sklearn.metrics import f1_score, average_precision_score, cohen_kappa_score
+from sklearn.metrics import precision_recall_curve
 
+data = pd.read_csv('points.csv',index_col='FID')
 
-# plot setting
+float_label = [
+    'Plan Curvature',
+    'Profile Curvature',
+    'SPI',
+    'NDVI',
+    'TWI',
+    'TRI',
+    'Surface Roughness',
+    'Elevation',
+    'Aspect',
+    'Slope',
+]
+cate_label = [
+    'Lithology', 'Distance from Road', 'Distance from Fault', 'Land Use'
+]
+labels = float_label + cate_label
+predictors = labels
+target_label = ['landslides']
+all_label = labels + target_label
+
+import matplotlib
+print(matplotlib.get_configdir())
 plt.rcParams.update({'font.size': 18})
 matplotlib.rc('axes', titlesize=18)
-plt.style.use(['science',])
+plt.style.use(['science', 'notebook'])
 plt.rcParams['font.serif'] = 'Times New Roman'
 
-# data
-df = pd.read_csv('lsm_all_value.csv', encoding='gbk', index_col=[0, 1]).astype(np.float32)
-df_train, df_test = train_test_split(df,test_size = 0.25, random_state=10)
-df_train_columns = df_train.columns
-X_columns = df.columns[:-1]
-
 # XGBoost
+import xgboost as xgb
+from xgboost.sklearn import XGBClassifier
+from sklearn.preprocessing import PolynomialFeatures
+from sklearn.feature_selection import SelectKBest, chi2
+from sklearn.model_selection import  RandomizedSearchCV
+from sklearn.metrics import make_scorer
+from sklearn.feature_selection import SelectKBest
+from sklearn.feature_selection import chi2
+from itertools import combinations
+from sklearn.model_selection import GridSearchCV
 
-dtrain = xgb.DMatrix(df_train[X_columns], label=df_train['target'], enable_categorical=True)
-dtest = xgb.DMatrix(df_test[X_columns], label=df_test['target'], enable_categorical=True)
+def modelfit(alg,
+             dtrain,
+             predictors,
+             useTrainCV=True,
+             cv_folds=5,
+             early_stopping_rounds=100):
 
-param = {'alpha': 0.08,
-         'booster': 'gbtree',
-         'colsample_bylevel': 0.7,
-         'colsample_bynode': 0.7,
-         'colsample_bytree': 1,
-         'gamma': 0.03,
-         'gpu_id': -1,
-         'interaction_constraints': '',
-         'learning_rate': 0.01,
-         'max_delta_step': 3,
-         'max_depth': 2,
-         'min_child_weight': 10,
-         'monotone_constraints': '()',
-         'n_jobs': 2,
-         'num_parallel_tree': 31,
-         'random_state': 7,
-         'reg_lambda': 0.74,
-         'subsample': 0.75,
-         'tree_method': 'exact',
-         'validate_parameters': 1,
-         'scale_pos_weight':1,
-         'verbosity': None,
-         }
-		 
-# training
-bst = xgb.train(param, dtrain)
+    if useTrainCV:
+        xgb_param = alg.get_xgb_params()
+        xgtrain = xgb.DMatrix(dtrain[predictors].values,
+                              label=dtrain['landslides'].values)
+        cvresult = xgb.cv(xgb_param,
+                          xgtrain,
+                          num_boost_round=alg.get_params()['n_estimators'],
+                          nfold=cv_folds,
+                          metrics='auc',
+                          early_stopping_rounds=early_stopping_rounds,
+                          verbose_eval=False)
+        alg.set_params(n_estimators=cvresult.shape[0])
 
-pred_train = bst.predict(dtrain)
-pred_train_label = np.int64(pred_train>=0.5)
-f1_train = f1_score(df_train['target'], pred_train_label)
+    # Fit the algorithm on the data
+    alg.fit(dtrain[predictors], dtrain['landslides'], eval_metric='auc')
 
-# testing
-preds = bst.predict(dtest)  
-auc_value = roc_auc_score(df_test['target'], preds)
+    # Predict training set:
+    dtrain_predictions = alg.predict(dtrain[predictors])
+    dtrain_predprob = alg.predict_proba(dtrain[predictors])[:, 1]
+    
+    print(cvresult.shape[0])
+    # Print model report:
+    print("\nModel Report")
+    print("Accuracy : %.4g" % metrics.accuracy_score(
+        dtrain['landslides'].values, dtrain_predictions))
+    print("AUC Score (Train): %f" %
+          metrics.roc_auc_score(dtrain['landslides'], dtrain_predprob))
 
-fpr, tpr, thresholds_roc = roc_curve(dtest.get_label(), preds)
+    feat_imp = pd.Series(
+        alg.get_booster().get_fscore()).sort_values(ascending=False)
+    feat_imp.plot(kind='bar', title='Feature Importances')
+    plt.ylabel('Feature Importance Score')
+    
+# Choose all predictors except target & IDcols
+predictors = labels
+xgb1 = xgb.sklearn.XGBClassifier(
+    learning_rate=0.1,
+    n_estimators=1000,
+    max_depth=5,
+    min_child_weight=1,
+    gamma=0,
+    subsample=0.8,
+    colsample_bytree=0.8,
+    objective='binary:logistic',
+    nthread=4,
+    scale_pos_weight=1,
+    seed=27)
+modelfit(xgb1, df_train, predictors)
+
+param_test1 = {
+    'max_depth': range(1, 100, 10),
+    'min_child_weight': range(1, 100, 10)
+}
+gsearch1 = GridSearchCV(estimator=XGBClassifier(learning_rate=0.1,
+                                                n_estimators=46,
+                                                max_depth=5,
+                                                min_child_weight=1,
+                                                gamma=0,
+                                                ubsample=0.8,
+                                                colsample_bytree=0.8,
+                                                objective='binary:logistic',
+                                                nthread=4,
+                                                scale_pos_weight=1,
+                                                seed=27),
+                        param_grid=param_test1,
+                        scoring='f1',
+                        n_jobs=4,
+                        cv=5)
+gsearch1.fit(df_train[predictors], df_train['landslides'])
+gsearch1.cv_results_, gsearch1.best_params_, gsearch1.best_score_
+
+param_test2 = {
+    'max_depth': range(1,20),
+    'min_child_weight': range(1,20),
+}
+gsearch2 = GridSearchCV(estimator=XGBClassifier(learning_rate=0.1,
+                                                n_estimators=46,
+                                                max_depth=11,
+                                                min_child_weight=11,
+                                                subsample=0.8,
+                                                colsample_bytree=0.8,
+                                                objective='binary:logistic',
+                                                nthread=4,
+                                                scale_pos_weight=1,
+                                                seed=27),
+                        param_grid=param_test2,
+                        scoring='f1',
+                        n_jobs=6,
+                        cv=5)
+gsearch2.fit(df_train[predictors], df_train['landslides'])
+gsearch2.cv_results_, gsearch2.best_params_, gsearch2.best_score_
+
+param_test3 = {
+    'gamma': [i/100 for i in range(0,100)]
+}
+gsearch3 = GridSearchCV(estimator=XGBClassifier(learning_rate=0.1,
+                                                n_estimators=46,
+                                                max_depth=2,
+                                                min_child_weight=8,
+                                                gamma=0,
+                                                subsample=0.8,
+                                                colsample_bytree=0.8,
+                                                objective='binary:logistic',
+                                                nthread=4,
+                                                scale_pos_weight=1,
+                                                seed=27),
+                        param_grid=param_test3,
+                        scoring='f1',
+                        n_jobs=4,
+                        cv=5)
+gsearch3.fit(df_train[predictors], df_train['landslides'])
+gsearch3.cv_results_, gsearch3.best_params_, gsearch3.best_score_
+
+xgb2 = XGBClassifier(learning_rate=0.1,
+                     n_estimators=1000,
+                     max_depth=2,
+                     min_child_weight=8,
+                     gamma=0.42,
+                     subsample=0.8,
+                     colsample_bytree=0.8,
+                     objective='binary:logistic',
+                     nthread=4,
+                     scale_pos_weight=1,
+                     seed=27)
+modelfit(xgb2, df_train, predictors)
+
+param_test4 = {
+    'subsample': [i/10 for i in range(1,10)],
+    'colsample_bytree': [i /10 for i in range(1,10)]
+} 
+gsearch4 = GridSearchCV(estimator=XGBClassifier(learning_rate=0.1,
+                                                n_estimators=145,
+                                                max_depth=2,
+                                                min_child_weight=8,
+                                                gamma=0.42,
+                                                subsample=0.8,
+                                                colsample_bytree=0.8,
+                                                objective='binary:logistic',
+                                                nthread=4,
+                                                scale_pos_weight=1,
+                                                seed=27),
+                        param_grid=param_test4,
+                        scoring='f1',
+                        n_jobs=4,
+                        cv=5)
+gsearch4.fit(df_train[predictors], df_train['landslides'])
+gsearch4.cv_results_, gsearch4.best_params_, gsearch4.best_score_
+
+param_test5 = {
+    'subsample': [i/100 for i in range(80,100)],
+    'colsample_bytree': [i /100 for i in range(70,90)]
+} 
+gsearch5 = GridSearchCV(estimator=XGBClassifier(learning_rate=0.1,
+                                                n_estimators=33,
+                                                max_depth=4,
+                                                min_child_weight=5,
+                                                gamma=0.5,
+                                                subsample=0.8,
+                                                colsample_bytree=0.7,
+                                                objective='binary:logistic',
+                                                nthread=4,
+                                                scale_pos_weight=1,
+                                                seed=27),
+                        param_grid=param_test5,
+                        scoring='roc_auc',
+                        n_jobs=4,
+                        cv=5)
+gsearch5.fit(df_train[predictors], df_train['landslides'])
+gsearch5.cv_results_, gsearch5.best_params_, gsearch5.best_score_
+
+param_test6 = {
+    'reg_alpha':[1e-5, 1e-4, 1e-3, 1e-2, 0.1, 1, 10, 100]
+} 
+gsearch6 = GridSearchCV(estimator=XGBClassifier(learning_rate=0.1,
+                                                n_estimators=145,
+                                                max_depth=2,
+                                                min_child_weight=8,
+                                                gamma=0.42,
+                                                subsample=0.82,
+                                                colsample_bytree=0.7,
+                                                objective='binary:logistic',
+                                                nthread=4,
+                                                scale_pos_weight=1,
+                                                seed=27),
+                        param_grid=param_test6,
+                        scoring='f1',
+                        n_jobs=4,
+                        cv=5)
+gsearch6.fit(df_train[predictors], df_train['landslides'])
+gsearch6.cv_results_, gsearch6.best_params_, gsearch6.best_score_
+
+param_test7 = {
+    'reg_alpha':[i/100 for i in range(1,30)]
+} 
+gsearch7 = GridSearchCV(estimator=XGBClassifier(learning_rate=0.1,
+                                                n_estimators=131,
+                                                max_depth=3,
+                                                min_child_weight=1,
+                                                gamma=0.5,
+                                                subsample=0.8,
+                                                colsample_bytree=0.72,
+                                                objective='binary:logistic',
+                                                nthread=6,
+                                                scale_pos_weight=1,
+                                                reg_alpha = 0.09,
+                                                seed=27),
+                        param_grid=param_test7,
+                        scoring='roc_auc',
+                        n_jobs=4,
+                        cv=5)
+gsearch7.fit(df_train[predictors], df_train['landslides'])
+gsearch7.cv_results_, gsearch7.best_params_, gsearch7.best_score_
+
+xgb3 = XGBClassifier(learning_rate=0.1,
+                     n_estimators=1000,
+                     max_depth=2,
+                     min_child_weight=8,
+                     gamma=0.4,
+                     subsample=0.8,
+                     colsample_bytree=0.7,
+                     objective='binary:logistic',
+                     nthread=6,
+                     scale_pos_weight=1,
+                     reg_alpha=0.01,
+                     seed=27)
+modelfit(xgb3, df_train, predictors)
+
+## 最终参数
+predictors = labels
+xgb4 = XGBClassifier(learning_rate=0.01,
+                     n_estimators=5000,
+                     max_depth=2,
+                     min_child_weight=8,
+                     gamma=0.4,
+                     subsample=0.8,
+                     colsample_bytree=0.7,
+                     objective='binary:logistic',
+                     nthread=6,
+                     scale_pos_weight=1,
+                     reg_alpha=0.01,
+                     seed=27)
+modelfit(xgb4, df_train, predictors)
+
+## test
+xgb_pred_train = xgb4.predict(df_train[predictors])
+xgb_prob_train = xgb4.predict_proba(df_train[predictors])[:, 1]
+f1_train = f1_score(df_train['landslides'], xgb_pred_train)
+print('train_f1:{}'.format(f1_train))
+
+xgb_pred_test = xgb4.predict(df_test[predictors])  # 预测
+xgb_prob_test = xgb4.predict_proba(df_test[predictors])[:, 1]
+
+auc_value = roc_auc_score(df_test['landslides'], xgb_prob_test)
+
+fpr, tpr, thresholds_roc = roc_curve(df_test['landslides'], xgb_prob_test)
 print('auc:{}'.format(auc_value))
-preds_label = np.int64(preds >= 0.5)
-recall_value = recall_score(dtest.get_label(), preds_label)
-print('racall:{}'.format(recall_value))
-precision_value = precision_score(dtest.get_label(), preds_label)
-print('precision:{}'.format(precision_value))
-f1 = f1_score(dtest.get_label(), preds_label)
-print('f1:{}'.format(f1))
+
+xgb_recall_value = recall_score(df_test['landslides'], xgb_pred_test)
+
+print('训练集预测均值：{}'.format(1-xgb_prob_train.mean()))
+print('训练集标签均值：{}'.format(1-xgb_pred_train.mean()))
+print('测试集预测均值：{}'.format(1-xgb_prob_test.mean()))
+print('测试集标签均值：{}'.format(1-xgb_pred_test.mean()))
+
+print('racall:{}'.format(xgb_recall_value))
+xgb_precision_value = precision_score(df_test['landslides'], xgb_pred_test)
+print('precision:{}'.format(xgb_precision_value))
+xgb_f1 = f1_score(df_test['landslides'], xgb_pred_test)
+print('f1:{}'.format(xgb_f1))
 precision_list, recall_list, thresholds = precision_recall_curve(
-    dtest.get_label(), preds)
+    df_test['landslides'], xgb_prob_test)
 
-auc_pr = average_precision_score(dtest.get_label(), preds)
+auc_pr = average_precision_score(df_test['landslides'], xgb_prob_test)
 print('prc:{}'.format(auc_pr))
+print(xgb_pred_test.mean())
+print(xgb_prob_test.mean())
 
-xgb_precisions, xgb_recalls, xgb_fpr, xgb_tpr, xgb_prc, xgb_auc = precision_list, recall_list, fpr, tpr, auc_pr, auc_value
-
-# Interpretation
-import shap
-
-ax = xgb.plot_importance(bst, importance_type='gain')
-fig = ax.figure
-fig.set_size_inches(10, 10)
-
-# Initializing the interpreter
-explainer = shap.TreeExplainer(model_sklearn,
-                               model_output='probability',
-                               feature_perturbation='interventional',
-                               data=df_test[X_columns])  
-shap.initjs() 
-
-# Calculate the SHAP value of each feature for each sample
-shap_values = explainer.shap_values(df_test[X_columns]) 
-
-# 
-fig_root = r'G:\文献\LSM\可解释性'
-fig_type = 'landslide_sample'
-for i in np.where(df_test['target']==1)[0]:
-    shap.force_plot(explainer.expected_value,
-                    shap_values[i, :],
-                    df_test[X_columns].iloc[i],
-                    matplotlib=True,
-                    show=False,
-                    #link='logit',
-                   )
-    figure_name = str(i)+'_'+'{:.2f}'.format(preds[i])
-    figpath = os.path.join(fig_root, fig_type, figure_name + '.PNG')
-    plt.savefig(figpath)
-
-shap.force_plot(explainer.expected_value,
-                shap_values[np.where(df_test['target'] == 1)[0]],
-                df_test[X_columns].iloc[np.where(df_test['target'] == 1)[0]])
-			
-shap.force_plot(explainer.expected_value,
-                shap_values[np.where(df_test['target'] == 0)[0]],
-                df_test[X_columns].iloc[np.where(df_test['target'] == 0)[0]])
-				
-# summarize the effects of all the features
-shap.summary_plot(shap_values, df_test[X_columns],)
-shap.summary_plot(shap_values, df_test[X_columns], plot_type="bar")
-
-shap_interaction_values = explainer.shap_interaction_values(df_test[X_columns])
-shap.summary_plot(shap_interaction_values, df_test[X_columns])
-
-# Feature Interpretation
-fig_root = r'G:\文献\LSM\可解释性'
-fig_type = 'dependence'
-for item in X_columns:
-    shap.dependence_plot(item,
-                         shap_values,
-                         df_test[X_columns],
-                         interaction_index=None,
-                         show=False)
-    figpath = os.path.join(fig_root, fig_type, item + '.PNG')
-    plt.savefig(figpath)
-	
-fig_root = r'G:\文献\LSM\可解释性'
-fig_type = 'Interaction'
-for i in range(len(X_columns)):
-    for j in range(len(X_columns)):
-        # print(X_columns[i] + "_" + X_columns[j])
-        col_i = X_columns[i]
-        col_j = X_columns[j]
-        shap.dependence_plot(col_i,
-                             shap_values,
-                             df_test[X_columns],
-                             interaction_index=col_j,
-                             show=False)
-        filename = col_i + '_' + col_j
-        figpath = os.path.join(fig_root, fig_type, filename + '.PNG')
-        plt.savefig(figpath)
-		
-		
-		
-# Random Forest
-from sklearn.ensemble import RandomForestClassifier
-
-rfc = RandomForestClassifier(n_estimators=91,
-                             random_state=7,
-                             max_depth=13,
-                             min_samples_leaf=1,
-                             min_samples_split=2)
-
-rfc.fit(df_train[X_columns], df_train['target'])  # 训练
-
-rf_pred_train = rfc.predict_proba(df_train[X_columns])[:,1]
-rf_pred_train_label = rfc.predict(df_train[X_columns])
-rf_f1_train = f1_score(df_train['target'], rf_pred_train_label)
-print('train_f1:{}'.format(f1_train))
-
-rf_preds = rfc.predict_proba(df_test[X_columns])[:,1]  # 预测
-rf_auc_value = roc_auc_score(df_test['target'], rf_preds)
-
-rf_fpr, rf_tpr, rf_thresholds_roc = roc_curve(df_test['target'], rf_preds)
-print('auc:{}'.format(rf_auc_value))
-rf_preds_label = rfc.predict(df_test[X_columns])
-rf_recall_value = recall_score(df_test['target'], rf_preds_label)
-print('racall:{}'.format(rf_recall_value))
-rf_precision_value = precision_score(df_test['target'], rf_preds_label)
-print('precision:{}'.format(rf_precision_value))
-rf_f1 = f1_score(df_test['target'], rf_preds_label)
-print('f1:{}'.format(rf_f1))
-rf_precision_list, rf_recall_list, rf_thresholds = precision_recall_curve(
-    df_test['target'], rf_preds)
-
-rf_auc_pr = average_precision_score(df_test['target'], rf_preds)
-print('prc:{}'.format(rf_auc_pr))
-
-# LightGBM
-import lightgbm as lgb
-lgb_train = lgb.Dataset(df_train[X_columns],
-                        label=df_train['target'],
-                        categorical_feature=[
-                            'Aspect', 'Land use', 'Distance from fault',
-                            'Distance from road'
-                        ])
-lgb_test = lgb.Dataset(df_test[X_columns],
-                       label=df_test['target'],
-                       categorical_feature=[
-                           'Aspect', 'Land use', 'Distance from fault',
-                           'Distance from road'
-                       ])
-					   
-			
-model = lgb.LGBMClassifier(boosting_type='gbdt',
-                           objective='binary',
-                           metrics='auc',
-                           learning_rate=0.01,
-                           n_estimators=940,
-                           max_depth=6,
-                           num_leaves=45,
-                           max_bin=175,
-                           min_data_in_leaf=31,
-                           bagging_fraction=0.9,
-                           bagging_freq=20,
-                           feature_fraction=0.9,
-                           lambda_l1=1e-05,
-                           lambda_l2=0.5,
-                           min_split_gain=0)
-model.fit(df_train[X_columns], df_train['target'])
-y_pre = model.predict(df_test[X_columns])
-# print("acc:", accuracy_score(df_test[X_columns], y_pre))
-print("auc:", roc_auc_score(df_test['target'], y_pre))
-
-pred_train = model.predict_proba(df_train[X_columns])[:,1]
-pred_train_label = np.int64(pred_train >= 0.5)
-f1_train = f1_score(df_train['target'], pred_train_label)
-print('train_f1:{}'.format(f1_train))
-
-preds = model.predict_proba(df_test[X_columns])[:,1]  # 预测
-lgb_auc_value = roc_auc_score(df_test['target'], preds)
-
-lgb_fpr, lgb_tpr, thresholds_roc = roc_curve(df_test['target'], preds)
-print('auc:{}'.format(lgb_auc_value))
-preds_label = np.int64(preds >= 0.5)
-recall_value = recall_score(df_test['target'], preds_label)
-print('racall:{}'.format(recall_value))
-precision_value = precision_score(df_test['target'], preds_label)
-print('precision:{}'.format(precision_value))
-f1 = f1_score(df_test['target'], preds_label)
-print('f1:{}'.format(f1))
-lgb_precision_list, lgb_recall_list, thresholds = precision_recall_curve(
-    df_test['target'], preds)
-
-lgb_auc_pr = average_precision_score(df_test['target'], preds)
-print('prc:{}'.format(auc_pr))
-
-# Receiver Operating Characteristic curve
-plt.figure()
-lw = 2
-plt.figure(figsize=(10, 10))
-plt.plot(xgb_fpr,
-         xgb_tpr,
-         color='darkblue',
-         lw=lw,
-         label='XGBoost (area = %0.2f)' %
-         auc_value)  # 假正率为横坐标，真正率为纵坐标做曲线
-
-plt.plot(rf_fpr,
-         rf_tpr,
-         color='darkgreen',
-         lw=lw,
-         label='Random Forest (area = %0.2f)' %
-         rf_auc_value)  # 假正率为横坐标，真正率为纵坐标做曲线
-
-plt.plot(lgb_fpr,
-         lgb_tpr,
-         color='darkorange',
-         lw=lw,
-         label='LightGBM (area = %0.2f)' %
-         lgb_auc_value)  # 假正率为横坐标，真正率为纵坐标做曲线
-
-plt.plot([0, 1], [0, 1], color='navy', lw=lw, linestyle='--')
-plt.xlim([-0.05, 1.0])
-plt.ylim([0.0, 1.05])
-plt.xlabel('False Positive Rate')
-plt.ylabel('True Positive Rate')
-plt.title('Receiver Operating Characteristic curve')
-plt.legend(loc="lower right")
-plt.show()
-
-# Precision recall curve
-plt.figure()
-lw = 2
-plt.figure(figsize=(10, 10))
-plt.plot(xgb_recalls,
-         xgb_precisions,
-         color='darkblue',
-         lw=lw,
-         label='XGBoost (area = %0.2f)' %
-         xgb_prc)  # 假正率为横坐标，真正率为纵坐标做曲线
-
-plt.plot(rf_recall_list,
-         rf_precision_list,
-         color='darkgreen',
-         lw=lw,
-         label='Random Forest (area = %0.2f)' %
-         rf_auc_pr)  # 假正率为横坐标，真正率为纵坐标做曲线
-
-plt.plot(lgb_recall_list,
-         lgb_precision_list,
-         color='darkorange',
-         lw=lw,
-         label='LighGBM (area = %0.2f)' %
-         lgb_auc_pr)  # 假正率为横坐标，真正率为纵坐标做曲线
-
-# plt.plot([0, 1], [0, 1], color='navy', lw=lw, linestyle='--')
-plt.xlim([-0.05, 1.0])
-plt.ylim([0.0, 1.05])
-plt.xlabel('Recall')
-plt.ylabel('Precision')
-plt.title('Precision recall curve')
-plt.legend(loc="lower right")
-plt.show()
